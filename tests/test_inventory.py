@@ -243,3 +243,75 @@ def test_patch_inventory_preserves_unrelated_products(client) -> None:
         Product(target.id, "Apples", 7, "kg"),
         unrelated,
     ]
+
+
+def test_get_inventory_alerts_uses_default_threshold_of_ten(client) -> None:
+    test_client, store = client
+    below = store.create("Apples", 9, "kg")
+    at_threshold = store.create("Rice", 10, "bags")
+    above = store.create("Coffee", 11, "bags")
+
+    response = test_client.get("/inventory/alerts")
+
+    assert response.status_code == 200
+    assert response.json() == [
+        {"id": below.id, "name": "Apples", "quantity": 9, "unit": "kg"}
+    ]
+    assert at_threshold.id not in {item["id"] for item in response.json()}
+    assert above.id not in {item["id"] for item in response.json()}
+
+
+def test_get_inventory_alerts_accepts_custom_threshold(client) -> None:
+    test_client, store = client
+    low = store.create("Apples", 4, "kg")
+    middle = store.create("Rice", 7, "bags")
+    high = store.create("Coffee", 10, "bags")
+
+    response = test_client.get("/inventory/alerts?threshold=8")
+
+    assert response.status_code == 200
+    assert [item["id"] for item in response.json()] == [low.id, middle.id]
+    assert high.id not in {item["id"] for item in response.json()}
+
+
+def test_get_inventory_alerts_returns_empty_for_empty_inventory(client) -> None:
+    test_client, _ = client
+
+    response = test_client.get("/inventory/alerts")
+
+    assert response.status_code == 200
+    assert response.json() == []
+
+
+def test_get_inventory_alerts_returns_empty_when_nothing_is_below_threshold(
+    client,
+) -> None:
+    test_client, store = client
+    store.create("Rice", 10, "bags")
+    store.create("Coffee", 15, "bags")
+
+    response = test_client.get("/inventory/alerts?threshold=10")
+
+    assert response.status_code == 200
+    assert response.json() == []
+
+
+@pytest.mark.parametrize("threshold", ["invalid", "-1", "1.5"])
+def test_get_inventory_alerts_rejects_invalid_threshold(client, threshold) -> None:
+    test_client, _ = client
+
+    response = test_client.get(f"/inventory/alerts?threshold={threshold}")
+
+    assert response.status_code == 422
+
+
+def test_get_inventory_alerts_does_not_mutate_csv(client) -> None:
+    test_client, store = client
+    store.create("Apples", 2, "kg")
+    store.create("Rice", 10, "bags")
+    original_contents = store.file_path.read_bytes()
+
+    response = test_client.get("/inventory/alerts")
+
+    assert response.status_code == 200
+    assert store.file_path.read_bytes() == original_contents

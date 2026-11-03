@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from uuid import uuid4
 
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field, field_validator
 
 
@@ -166,6 +166,15 @@ def create_inventory_product(
 ) -> Product:
     """Create a product and persist it in the inventory CSV file."""
     return store.create(product.name, product.quantity, product.unit)
+
+
+@app.get("/inventory/alerts", response_model=list[Product])
+def get_inventory_alerts(
+    threshold: int = Query(default=10, ge=0),
+    store: CsvProductStore = Depends(get_product_store),
+) -> list[Product]:
+    """Return products whose stock is below the requested threshold."""
+    return [product for product in store.list_all() if product.quantity < threshold]
 
 
 @app.patch("/inventory/{product_id}", response_model=Product)
