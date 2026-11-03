@@ -6,6 +6,7 @@ from pathlib import Path
 from uuid import uuid4
 
 from fastapi import Depends, FastAPI
+from pydantic import BaseModel, Field, field_validator
 
 
 app = FastAPI()
@@ -19,6 +20,21 @@ class Product:
     name: str
     quantity: int
     unit: str
+
+
+class ProductCreate(BaseModel):
+    """Input fields required to register a product."""
+
+    name: str
+    quantity: int = Field(ge=0)
+    unit: str
+
+    @field_validator("name", "unit")
+    @classmethod
+    def reject_blank_text(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("must not be empty or whitespace only")
+        return value
 
 
 class CsvProductStore:
@@ -97,3 +113,12 @@ def get_inventory(
 ) -> list[Product]:
     """Return all products in the inventory without modifying the CSV file."""
     return store.list_all()
+
+
+@app.post("/inventory", response_model=Product, status_code=201)
+def create_inventory_product(
+    product: ProductCreate,
+    store: CsvProductStore = Depends(get_product_store),
+) -> Product:
+    """Create a product and persist it in the inventory CSV file."""
+    return store.create(product.name, product.quantity, product.unit)

@@ -80,3 +80,50 @@ def test_get_inventory_returns_all_products_without_mutating_csv(client) -> None
         {"id": second.id, "name": "Rice", "quantity": 5, "unit": "bags"},
     ]
     assert store.file_path.read_bytes() == original_contents
+
+
+def test_post_inventory_creates_product_and_persists_csv(client) -> None:
+    test_client, store = client
+    payload = {"name": "Coffee", "quantity": 3, "unit": "bags"}
+
+    response = test_client.post("/inventory", json=payload)
+
+    assert response.status_code == 201
+    created_product = response.json()
+    assert created_product["name"] == payload["name"]
+    assert created_product["quantity"] == payload["quantity"]
+    assert created_product["unit"] == payload["unit"]
+    assert created_product["id"]
+    assert CsvProductStore(store.file_path).get(created_product["id"]) == Product(
+        **created_product
+    )
+
+
+def test_post_inventory_generates_unique_ids(client) -> None:
+    test_client, _ = client
+    payload = {"name": "Beans", "quantity": 2, "unit": "kg"}
+
+    first_response = test_client.post("/inventory", json=payload)
+    second_response = test_client.post("/inventory", json=payload)
+
+    assert first_response.status_code == 201
+    assert second_response.status_code == 201
+    assert first_response.json()["id"] != second_response.json()["id"]
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"name": "", "quantity": 1, "unit": "kg"},
+        {"name": "   ", "quantity": 1, "unit": "kg"},
+        {"name": "Beans", "quantity": 1, "unit": ""},
+        {"name": "Beans", "quantity": 1, "unit": "  "},
+        {"name": "Beans", "quantity": -1, "unit": "kg"},
+    ],
+)
+def test_post_inventory_rejects_invalid_data(client, payload) -> None:
+    test_client, _ = client
+
+    response = test_client.post("/inventory", json=payload)
+
+    assert response.status_code == 422
