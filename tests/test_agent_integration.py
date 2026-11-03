@@ -14,6 +14,20 @@ from fastapi.testclient import TestClient
 
 import agent
 from api.app import CsvProductStore, app, get_product_store
+from conversation_logger import log_interaction
+
+
+@pytest.fixture(autouse=True)
+def isolate_conversation_log(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Redirect agent integration logging away from the operational CSV."""
+    # These tests exercise the real logger, but its destination is test-local.
+    monkeypatch.setattr(
+        agent,
+        "log_interaction",
+        lambda actor, message, tool_call="": log_interaction(
+            actor, message, tool_call, file_path=tmp_path / "conversation_log.csv"
+        ),
+    )
 
 
 class InProcessResponse:

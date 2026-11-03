@@ -9,6 +9,21 @@ import pytest
 
 import agent
 from agent import AgentLoopError, run_agent_turn
+from conversation_logger import log_interaction
+
+
+@pytest.fixture(autouse=True)
+def isolate_conversation_log(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep loop tests' default logger writes inside pytest's temporary area."""
+    # Retain the real CSV logger behavior while preventing writes to the
+    # operational project-root log during tests.
+    monkeypatch.setattr(
+        agent,
+        "log_interaction",
+        lambda actor, message, tool_call="": log_interaction(
+            actor, message, tool_call, file_path=tmp_path / "conversation_log.csv"
+        ),
+    )
 
 
 def response(content: str | None = None, tool_calls: list[Any] | None = None):

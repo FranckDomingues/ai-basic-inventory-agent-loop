@@ -9,6 +9,20 @@ from unittest.mock import Mock
 import pytest
 
 import agent
+from conversation_logger import log_interaction
+
+
+@pytest.fixture(autouse=True)
+def isolate_conversation_log(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep CLI test logging in a per-test temporary directory."""
+    # The CLI delegates logging to the agent loop, so patch the loop's logger.
+    monkeypatch.setattr(
+        agent,
+        "log_interaction",
+        lambda actor, message, tool_call="": log_interaction(
+            actor, message, tool_call, file_path=tmp_path / "conversation_log.csv"
+        ),
+    )
 
 
 class InputSequence:

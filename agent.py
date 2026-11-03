@@ -12,6 +12,8 @@ from urllib.request import Request, urlopen
 
 from openai import OpenAI
 
+from conversation_logger import log_interaction
+
 
 _GROQ_BASE_URL = "https://api.groq.com/openai/v1"
 _OLLAMA_BASE_URL = "http://localhost:11434/v1"
@@ -354,11 +356,16 @@ def run_agent_turn(
     model: str | None = None,
     max_iterations: int = _DEFAULT_MAX_ITERATIONS,
     api_base_url: str | None = None,
+    log_callback: Callable[[str, str, str], None] | None = None,
 ) -> str:
     """Run one user turn through the manual observe-think-act-update loop.
 
     The caller owns ``messages`` and should reuse the same list on later turns
-    to retain the in-memory conversation history for a session.
+    to retain the in-memory conversation history for a session. This loop owns
+    logging each processed event; the CLI delegates here rather than logging
+    the same user or assistant messages a second time. Supply ``log_callback``
+    to inject a logger (for example, a partially applied ``log_interaction``
+    targeting a temporary CSV file); otherwise the project CSV logger is used.
 
     Args:
         client: An initialized OpenAI-compatible client with chat completions.
@@ -369,6 +376,8 @@ def run_agent_turn(
         max_iterations: Maximum number of LLM responses, including the final
             answer, allowed for this turn.
         api_base_url: Optional inventory API root passed to tool dispatch.
+        log_callback: Optional callback accepting actor, message, and tool-call
+            metadata. CSV write errors from the callback are allowed to surface.
 
     Returns:
         The final assistant text, also appended to ``messages``.
@@ -377,6 +386,7 @@ def run_agent_turn(
         ValueError: If input, history, or iteration limit is invalid.
         AgentLoopError: If the LLM request fails, its response is malformed, or
             the iteration limit is reached before a final answer.
+        OSError: If the configured conversation logger cannot write an event.
     """
     if not isinstance(user_input, str) or not user_input.strip():
         raise ValueError("user_input must be a non-empty string")
@@ -387,7 +397,10 @@ def run_agent_turn(
 
     config = LLMConfig.from_env()
     selected_model = model or os.environ.get("LLM_MODEL") or config.model
+    write_log = log_interaction if log_callback is None else log_callback
     messages.append({"role": "user", "content": user_input})
+    # Logging happens at the accepted-turn boundary, once, before any LLM call.
+    write_log("user", user_input, "")
 
     for iteration in range(max_iterations):
         try:
@@ -400,6 +413,7 @@ def run_agent_turn(
         except Exception as error:
             # SDK exceptions may contain request headers or secrets; expose only
             # the exception class and a stable, non-sensitive failure message.
+            write_log("agent", "LLM request failed; no final answer was produced", "")
             raise AgentLoopError(
                 f"LLM request failed ({type(error).__name__}); no final answer was produced"
             ) from None
@@ -410,12 +424,15 @@ def run_agent_turn(
             content = assistant_message.content
             tool_calls = assistant_message.tool_calls or []
         except (AttributeError, IndexError, TypeError) as error:
+            write_log("agent", "LLM returned a malformed response", "")
             raise AgentLoopError("LLM returned a malformed response") from error
 
         if not tool_calls:
             if not isinstance(content, str):
+                write_log("agent", "LLM returned a final response without text", "")
                 raise AgentLoopError("LLM returned a final response without text")
             messages.append({"role": "assistant", "content": content})
+            write_log("agent", content, "")
             return content
 
         assistant_entry: dict[str, Any] = {
@@ -431,8 +448,10 @@ def run_agent_turn(
                 tool_name = function.name
                 arguments = function.arguments
             except AttributeError as error:
+                write_log("agent", "LLM returned a malformed tool request", "")
                 raise AgentLoopError("LLM returned a malformed tool call") from error
             if not isinstance(call_id, str) or not call_id:
+                write_log("agent", "LLM returned a tool request without a valid ID", "")
                 raise AgentLoopError("LLM returned a tool call without a valid ID")
 
             assistant_entry["tool_calls"].append(
@@ -447,6 +466,20 @@ def run_agent_turn(
         # The assistant's tool-call record must precede its results in the
         # history so the next LLM request can match every result to its call ID.
         messages.append(assistant_entry)
+        # Each requested call gets its own agent row so identifiers remain
+        # independently searchable and map one-to-one to subsequent tool rows.
+        for call_id, tool_name, _arguments in pending_calls:
+            request_metadata = json.dumps(
+                {
+                    "name": tool_name if isinstance(tool_name, str) else "unknown",
+                    "id": call_id,
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            write_log(
+                "agent", content if isinstance(content, str) else "", request_metadata
+            )
         for call_id, tool_name, arguments in pending_calls:
             try:
                 result = execute_inventory_tool(
@@ -458,15 +491,39 @@ def run_agent_turn(
                 result = _error_result(
                     "tool_execution_error", "Inventory tool execution failed"
                 )
+            result_content = json.dumps(result, ensure_ascii=False)
             messages.append(
                 {
                     "role": "tool",
                     "tool_call_id": call_id,
-                    "content": json.dumps(result, ensure_ascii=False),
+                    "content": result_content,
                 }
             )
+            # Error details can contain server or transport text; log only the
+            # stable error category while retaining full results in memory.
+            logged_result = result
+            if result.get("ok") is False:
+                error = result.get("error")
+                error_type = error.get("type") if isinstance(error, dict) else "tool_error"
+                if not isinstance(error_type, str):
+                    error_type = "tool_error"
+                logged_result = {"ok": False, "error": {"type": error_type}}
+            tool_metadata = json.dumps(
+                {
+                    "name": tool_name if isinstance(tool_name, str) else "unknown",
+                    "id": call_id,
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            write_log("tool", json.dumps(logged_result, ensure_ascii=False), tool_metadata)
 
         if iteration == max_iterations - 1:
+            write_log(
+                "agent",
+                f"Maximum LLM iterations ({max_iterations}) reached before a final answer",
+                "",
+            )
             raise AgentLoopError(
                 f"Maximum LLM iterations ({max_iterations}) reached before a final answer"
             )
@@ -479,6 +536,7 @@ def run_cli(
     *,
     input_fn: Callable[[str], str] | None = None,
     output_fn: Callable[[str], Any] | None = None,
+    log_callback: Callable[[str, str, str], None] | None = None,
 ) -> None:
     """Run an interactive terminal conversation with the inventory agent.
 
@@ -489,14 +547,18 @@ def run_cli(
             Defaults to :func:`input`.
         output_fn: Optional output function, injectable for isolated tests.
             Defaults to :func:`print`.
+        log_callback: Optional logger callback forwarded to ``run_agent_turn``.
+            The loop owns all event records, preventing CLI duplicates.
 
     Returns:
         ``None`` when the user exits, the input stream ends, or the client
         cannot be initialized.
 
     Raises:
-        No expected terminal, initialization, or agent-loop errors escape; they
-        are handled with safe messages so the CLI can exit or continue cleanly.
+        OSError: If the conversation logger cannot write an event. Logging
+            failures are surfaced rather than allowing an unlogged session.
+        No expected terminal, initialization, or agent-loop errors other than
+            logger write failures escape; they are handled with safe messages.
     """
     read_input = input if input_fn is None else input_fn
     write_output = print if output_fn is None else output_fn
@@ -527,13 +589,24 @@ def run_cli(
             return
 
         try:
-            answer = run_agent_turn(client, messages, user_input)
+            if log_callback is None:
+                # Do not pass a new keyword on the default path; this preserves
+                # compatibility with callers and tests replacing run_agent_turn.
+                answer = run_agent_turn(client, messages, user_input)
+            else:
+                answer = run_agent_turn(
+                    client, messages, user_input, log_callback=log_callback
+                )
         except KeyboardInterrupt:
             write_output("\nRequest interrupted. Goodbye.")
             return
         except (AgentLoopError, ValueError) as error:
             write_output(f"Agent error: {error}")
             continue
+        except OSError:
+            # CSV destination failures are operational errors, not recoverable
+            # agent failures; surface them rather than silently dropping logs.
+            raise
         except Exception:
             # Keep the session usable without displaying arbitrary exception
             # text, which could include request headers or credentials.
