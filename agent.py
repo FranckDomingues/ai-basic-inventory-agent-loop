@@ -5,7 +5,7 @@ import math
 import os
 from dataclasses import dataclass
 from http.client import HTTPException
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode, urlsplit
 from urllib.request import Request, urlopen
@@ -472,3 +472,76 @@ def run_agent_turn(
             )
 
     raise AgentLoopError("Agent loop ended without a final answer")
+
+
+def run_cli(
+    client: Any | None = None,
+    *,
+    input_fn: Callable[[str], str] | None = None,
+    output_fn: Callable[[str], Any] | None = None,
+) -> None:
+    """Run an interactive terminal conversation with the inventory agent.
+
+    Args:
+        client: Optional initialized OpenAI-compatible client. If omitted, the
+            existing provider configuration is used to create one session client.
+        input_fn: Optional prompt function, injectable for isolated tests.
+            Defaults to :func:`input`.
+        output_fn: Optional output function, injectable for isolated tests.
+            Defaults to :func:`print`.
+
+    Returns:
+        ``None`` when the user exits, the input stream ends, or the client
+        cannot be initialized.
+
+    Raises:
+        No expected terminal, initialization, or agent-loop errors escape; they
+        are handled with safe messages so the CLI can exit or continue cleanly.
+    """
+    read_input = input if input_fn is None else input_fn
+    write_output = print if output_fn is None else output_fn
+    write_output("Welcome to the AI inventory assistant.")
+    write_output("Ask about inventory, or type 'exit' or 'quit' to leave.")
+
+    if client is None:
+        try:
+            client = create_llm_client()
+        except Exception:
+            # Initialization exceptions can contain provider details or secrets.
+            write_output("Unable to initialize the LLM client. Check your provider configuration.")
+            return
+
+    # This one list belongs to the whole CLI session; each turn appends to it.
+    messages: list[dict[str, Any]] = []
+    while True:
+        try:
+            user_input = read_input("You: ")
+        except (EOFError, KeyboardInterrupt):
+            write_output("\nGoodbye.")
+            return
+
+        if not isinstance(user_input, str) or not user_input.strip():
+            continue
+        if user_input.strip().casefold() in {"exit", "quit"}:
+            write_output("Goodbye.")
+            return
+
+        try:
+            answer = run_agent_turn(client, messages, user_input)
+        except KeyboardInterrupt:
+            write_output("\nRequest interrupted. Goodbye.")
+            return
+        except (AgentLoopError, ValueError) as error:
+            write_output(f"Agent error: {error}")
+            continue
+        except Exception:
+            # Keep the session usable without displaying arbitrary exception
+            # text, which could include request headers or credentials.
+            write_output("Agent request failed unexpectedly. You can try again or exit.")
+            continue
+
+        write_output(f"Assistant: {answer}")
+
+
+if __name__ == "__main__":
+    run_cli()
