@@ -3,9 +3,11 @@
 import csv
 import json
 from functools import partial
+from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
+from urllib.error import HTTPError
 
 import pytest
 
@@ -263,6 +265,83 @@ def test_tool_errors_are_logged_without_sensitive_details(
         "unknown_tool",
         "invalid_arguments",
         "tool_execution_error",
+    }
+
+
+def test_malformed_tool_arguments_are_logged_with_call_correlation(
+    tmp_path: Path,
+) -> None:
+    file_path = tmp_path / "conversation.csv"
+
+    run_agent_turn(
+        MockClient(
+            [
+                make_response(
+                    tool_calls=[
+                        make_tool_call("bad-json-id", "create_product", "{not-json")
+                    ]
+                ),
+                make_response("The product request was malformed."),
+            ]
+        ),
+        [],
+        "Create a product",
+        log_callback=make_logger(file_path),
+    )
+
+    rows = read_rows(file_path)
+    assert [row["actor"] for row in rows] == ["user", "agent", "tool", "agent"]
+    assert json.loads(rows[2]["message"]) == {
+        "ok": False,
+        "error": {"type": "invalid_arguments"},
+    }
+    assert json.loads(rows[1]["tool_call"]) == json.loads(rows[2]["tool_call"]) == {
+        "name": "create_product",
+        "id": "bad-json-id",
+    }
+
+
+def test_http_tool_failure_logs_safe_category_and_call_correlation(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    private_response = b'{"detail":"access_token=do-not-log"}'
+
+    def fail_request(request: Any, timeout: float) -> Any:
+        raise HTTPError(
+            request.full_url,
+            503,
+            "Service unavailable",
+            hdrs=None,
+            fp=BytesIO(private_response),
+        )
+
+    monkeypatch.setattr(agent, "urlopen", fail_request)
+    file_path = tmp_path / "conversation.csv"
+
+    run_agent_turn(
+        MockClient(
+            [
+                make_response(
+                    tool_calls=[make_tool_call("http-fail-id", "list_inventory")]
+                ),
+                make_response("The inventory service is unavailable."),
+            ]
+        ),
+        [],
+        "List inventory",
+        log_callback=make_logger(file_path),
+    )
+
+    rows = read_rows(file_path)
+    tool_row = next(row for row in rows if row["actor"] == "tool")
+    assert json.loads(tool_row["message"]) == {
+        "ok": False,
+        "error": {"type": "http_error"},
+    }
+    assert "do-not-log" not in tool_row["message"]
+    assert json.loads(tool_row["tool_call"]) == {
+        "name": "list_inventory",
+        "id": "http-fail-id",
     }
 
 
