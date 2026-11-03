@@ -1,4 +1,8 @@
-"""FastAPI application base and CSV-backed product persistence."""
+"""FastAPI inventory endpoints backed by a local CSV product store.
+
+The module defines the product data models, CSV persistence operations, and
+HTTP routes for listing, creating, updating, and filtering inventory products.
+"""
 
 import csv
 from dataclasses import dataclass
@@ -14,7 +18,14 @@ app = FastAPI()
 
 @dataclass(frozen=True)
 class Product:
-    """A product stored in the inventory."""
+    """A product record returned by the inventory API.
+
+    Attributes:
+        id: Unique identifier assigned when the product is created.
+        name: Product name.
+        quantity: Current stock count.
+        unit: Unit used to describe the stock count.
+    """
 
     id: str
     name: str
@@ -23,7 +34,11 @@ class Product:
 
 
 class ProductCreate(BaseModel):
-    """Input fields required to register a product."""
+    """Validated request body for creating an inventory product.
+
+    Names and units must contain at least one non-whitespace character, and
+    quantity must be zero or greater.
+    """
 
     name: str
     quantity: int = Field(ge=0)
@@ -32,23 +47,37 @@ class ProductCreate(BaseModel):
     @field_validator("name", "unit")
     @classmethod
     def reject_blank_text(cls, value: str) -> str:
+        """Reject a name or unit made only of whitespace."""
         if not value.strip():
             raise ValueError("must not be empty or whitespace only")
         return value
 
 
 class StockDelta(BaseModel):
-    """Signed integer adjustment to a product's stock quantity."""
+    """Validated request body for changing a product's stock.
+
+    The integer delta may be positive, negative, or zero; the resulting stock
+    quantity is checked by the store before it is persisted.
+    """
 
     delta: int = Field(strict=True)
 
 
 class CsvProductStore:
-    """Persist and retrieve products using a CSV file."""
+    """Read and write inventory product records in a CSV file.
+
+    The default file is ``products.csv`` in the project root. Passing a path
+    allows callers and tests to use a separate inventory file.
+    """
 
     fieldnames = ("id", "name", "quantity", "unit")
 
     def __init__(self, file_path: Path | str | None = None) -> None:
+        """Configure the CSV path, using the project data file by default.
+
+        Args:
+            file_path: Optional path to the CSV file used by this store.
+        """
         self.file_path = (
             Path(file_path)
             if file_path is not None
@@ -56,7 +85,16 @@ class CsvProductStore:
         )
 
     def create(self, name: str, quantity: int, unit: str) -> Product:
-        """Create a product with a unique identifier and append it to CSV."""
+        """Assign an identifier and append a new product to the CSV file.
+
+        Args:
+            name: Product name.
+            quantity: Initial non-negative stock quantity.
+            unit: Unit associated with the quantity.
+
+        Returns:
+            The product record that was written.
+        """
         product = Product(
             id=str(uuid4()),
             name=name,
@@ -67,6 +105,7 @@ class CsvProductStore:
 
         with self.file_path.open("a", newline="", encoding="utf-8") as csv_file:
             writer = csv.DictWriter(csv_file, fieldnames=self.fieldnames)
+            # Initialize the CSV schema once, while preserving existing rows.
             if write_header:
                 writer.writeheader()
             writer.writerow(
@@ -81,7 +120,12 @@ class CsvProductStore:
         return product
 
     def list_all(self) -> list[Product]:
-        """Return every product currently stored in the CSV file."""
+        """Load all products from disk, or return an empty list if absent.
+
+        Returns:
+            Product records in CSV order. This read does not create or modify
+            the data file.
+        """
         if not self.file_path.exists():
             return []
 
@@ -98,14 +142,32 @@ class CsvProductStore:
             ]
 
     def get(self, product_id: str) -> Product | None:
-        """Return a product by identifier, or None if it is not present."""
+        """Find a product by ID.
+
+        Args:
+            product_id: Identifier to search for.
+
+        Returns:
+            The matching product, or ``None`` when no record has that ID.
+        """
         return next(
             (product for product in self.list_all() if product.id == product_id),
             None,
         )
 
     def update_quantity(self, product_id: str, delta: int) -> Product | None:
-        """Apply a stock delta and persist all products, or return None if absent."""
+        """Apply a signed stock adjustment and save the inventory.
+
+        Args:
+            product_id: Identifier of the product to update.
+            delta: Signed integer adjustment to its current quantity.
+
+        Returns:
+            The updated product, or ``None`` if the ID is not present.
+
+        Raises:
+            ValueError: If applying the delta would make stock negative.
+        """
         products = self.list_all()
         product_index = next(
             (index for index, product in enumerate(products) if product.id == product_id),
@@ -127,6 +189,7 @@ class CsvProductStore:
         )
         products[product_index] = updated_product
 
+        # Rewrite the complete CSV so unrelated products remain unchanged.
         with self.file_path.open("w", newline="", encoding="utf-8") as csv_file:
             writer = csv.DictWriter(csv_file, fieldnames=self.fieldnames)
             writer.writeheader()
@@ -147,7 +210,7 @@ product_store = CsvProductStore()
 
 
 def get_product_store() -> CsvProductStore:
-    """Provide the CSV-backed product store to API routes."""
+    """Provide the shared CSV store used by inventory route dependencies."""
     return product_store
 
 
@@ -155,7 +218,11 @@ def get_product_store() -> CsvProductStore:
 def get_inventory(
     store: CsvProductStore = Depends(get_product_store),
 ) -> list[Product]:
-    """Return all products in the inventory without modifying the CSV file."""
+    """List all stored products.
+
+    Returns:
+        HTTP 200 with a JSON array, or an empty array when inventory is empty.
+    """
     return store.list_all()
 
 
@@ -164,7 +231,15 @@ def create_inventory_product(
     product: ProductCreate,
     store: CsvProductStore = Depends(get_product_store),
 ) -> Product:
-    """Create a product and persist it in the inventory CSV file."""
+    """Create and persist a product from the validated request body.
+
+    Returns:
+        HTTP 201 with the created product, including its generated ID.
+
+    Raises:
+        HTTP 422: If the name or unit is blank, quantity is negative, or the
+            request body does not match the product schema.
+    """
     return store.create(product.name, product.quantity, product.unit)
 
 
@@ -173,7 +248,18 @@ def get_inventory_alerts(
     threshold: int = Query(default=10, ge=0),
     store: CsvProductStore = Depends(get_product_store),
 ) -> list[Product]:
-    """Return products whose stock is below the requested threshold."""
+    """List products with stock strictly below the threshold.
+
+    Args:
+        threshold: Non-negative stock boundary; defaults to 10. Products at
+            exactly this quantity are not included.
+
+    Returns:
+        HTTP 200 with matching products, or an empty array if none match.
+
+    Raises:
+        HTTP 422: If the threshold is not a valid non-negative integer.
+    """
     return [product for product in store.list_all() if product.quantity < threshold]
 
 
@@ -183,7 +269,16 @@ def update_inventory_product(
     stock_delta: StockDelta,
     store: CsvProductStore = Depends(get_product_store),
 ) -> Product:
-    """Apply a signed stock adjustment and return the updated product."""
+    """Apply the request's signed stock delta to an existing product.
+
+    Returns:
+        HTTP 200 with the updated product.
+
+    Raises:
+        HTTP 404: If ``product_id`` does not identify a stored product.
+        HTTP 409: If the update would make the quantity negative.
+        HTTP 422: If the request body does not contain a valid integer delta.
+    """
     try:
         updated_product = store.update_quantity(product_id, stock_delta.delta)
     except ValueError as error:
