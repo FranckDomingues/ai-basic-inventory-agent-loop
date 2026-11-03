@@ -127,3 +127,119 @@ def test_post_inventory_rejects_invalid_data(client, payload) -> None:
     response = test_client.post("/inventory", json=payload)
 
     assert response.status_code == 422
+
+
+def test_patch_inventory_increases_stock(client) -> None:
+    test_client, store = client
+    product = store.create("Apples", 5, "kg")
+
+    response = test_client.patch(
+        f"/inventory/{product.id}", json={"delta": 3}
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "id": product.id,
+        "name": "Apples",
+        "quantity": 8,
+        "unit": "kg",
+    }
+
+
+def test_patch_inventory_decreases_stock(client) -> None:
+    test_client, store = client
+    product = store.create("Apples", 5, "kg")
+
+    response = test_client.patch(
+        f"/inventory/{product.id}", json={"delta": -2}
+    )
+
+    assert response.status_code == 200
+    assert response.json()["quantity"] == 3
+
+
+def test_patch_inventory_zero_delta_keeps_stock(client) -> None:
+    test_client, store = client
+    product = store.create("Apples", 5, "kg")
+
+    response = test_client.patch(
+        f"/inventory/{product.id}", json={"delta": 0}
+    )
+
+    assert response.status_code == 200
+    assert response.json()["quantity"] == 5
+
+
+def test_patch_inventory_returns_404_for_unknown_product(client) -> None:
+    test_client, _ = client
+
+    response = test_client.patch("/inventory/unknown-id", json={"delta": 1})
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == "Product not found"
+
+
+def test_patch_inventory_rejects_insufficient_stock_without_mutation(client) -> None:
+    test_client, store = client
+    product = store.create("Apples", 2, "kg")
+    original_contents = store.file_path.read_bytes()
+
+    response = test_client.patch(
+        f"/inventory/{product.id}", json={"delta": -3}
+    )
+
+    assert response.status_code == 409
+    assert "cannot be negative" in response.json()["detail"]
+    assert store.file_path.read_bytes() == original_contents
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {},
+        {"delta": "not-a-number"},
+        {"delta": 1.5},
+        {"delta": True},
+        {"delta": None},
+    ],
+)
+def test_patch_inventory_rejects_invalid_delta(client, payload) -> None:
+    test_client, store = client
+    product = store.create("Apples", 2, "kg")
+
+    response = test_client.patch(f"/inventory/{product.id}", json=payload)
+
+    assert response.status_code == 422
+
+
+def test_patch_inventory_quantity_persists_and_get_returns_it(client) -> None:
+    test_client, store = client
+    product = store.create("Apples", 5, "kg")
+
+    patch_response = test_client.patch(
+        f"/inventory/{product.id}", json={"delta": -2}
+    )
+    restored_store = CsvProductStore(store.file_path)
+    get_response = test_client.get("/inventory")
+
+    assert patch_response.status_code == 200
+    assert restored_store.get(product.id).quantity == 3
+    assert get_response.json() == [
+        {"id": product.id, "name": "Apples", "quantity": 3, "unit": "kg"}
+    ]
+
+
+def test_patch_inventory_preserves_unrelated_products(client) -> None:
+    test_client, store = client
+    target = store.create("Apples", 5, "kg")
+    unrelated = store.create("Rice", 10, "bags")
+
+    response = test_client.patch(
+        f"/inventory/{target.id}", json={"delta": 2}
+    )
+
+    assert response.status_code == 200
+    assert CsvProductStore(store.file_path).list_all() == [
+        Product(target.id, "Apples", 7, "kg"),
+        unrelated,
+    ]
