@@ -17,6 +17,7 @@ _GROQ_BASE_URL = "https://api.groq.com/openai/v1"
 _OLLAMA_BASE_URL = "http://localhost:11434/v1"
 _DEFAULT_API_BASE_URL = "http://127.0.0.1:8000"
 _DEFAULT_TIMEOUT = 10.0
+_DEFAULT_MAX_ITERATIONS = 8
 
 INVENTORY_TOOLS: list[dict[str, Any]] = [
     {
@@ -339,3 +340,135 @@ def _http_error_result(status_code: int, response_body: bytes) -> dict[str, Any]
         status_code=status_code,
         detail=detail,
     )
+
+
+class AgentLoopError(RuntimeError):
+    """Raised when the LLM conversation cannot safely continue."""
+
+
+def run_agent_turn(
+    client: Any,
+    messages: list[dict[str, Any]],
+    user_input: str,
+    *,
+    model: str | None = None,
+    max_iterations: int = _DEFAULT_MAX_ITERATIONS,
+    api_base_url: str | None = None,
+) -> str:
+    """Run one user turn through the manual observe-think-act-update loop.
+
+    The caller owns ``messages`` and should reuse the same list on later turns
+    to retain the in-memory conversation history for a session.
+
+    Args:
+        client: An initialized OpenAI-compatible client with chat completions.
+        messages: Mutable conversation history, updated in place.
+        user_input: New user message to process.
+        model: Optional model override. When omitted, ``LLM_MODEL`` or the
+            configured provider's default model is used.
+        max_iterations: Maximum number of LLM responses, including the final
+            answer, allowed for this turn.
+        api_base_url: Optional inventory API root passed to tool dispatch.
+
+    Returns:
+        The final assistant text, also appended to ``messages``.
+
+    Raises:
+        ValueError: If input, history, or iteration limit is invalid.
+        AgentLoopError: If the LLM request fails, its response is malformed, or
+            the iteration limit is reached before a final answer.
+    """
+    if not isinstance(user_input, str) or not user_input.strip():
+        raise ValueError("user_input must be a non-empty string")
+    if not isinstance(messages, list) or any(not isinstance(message, dict) for message in messages):
+        raise ValueError("messages must be a list of message dictionaries")
+    if isinstance(max_iterations, bool) or not isinstance(max_iterations, int) or max_iterations < 1:
+        raise ValueError("max_iterations must be a positive integer")
+
+    config = LLMConfig.from_env()
+    selected_model = model or os.environ.get("LLM_MODEL") or config.model
+    messages.append({"role": "user", "content": user_input})
+
+    for iteration in range(max_iterations):
+        try:
+            completion = client.chat.completions.create(
+                model=selected_model,
+                messages=messages,
+                tools=INVENTORY_TOOLS,
+                tool_choice="auto",
+            )
+        except Exception as error:
+            # SDK exceptions may contain request headers or secrets; expose only
+            # the exception class and a stable, non-sensitive failure message.
+            raise AgentLoopError(
+                f"LLM request failed ({type(error).__name__}); no final answer was produced"
+            ) from None
+
+        try:
+            choice = completion.choices[0]
+            assistant_message = choice.message
+            content = assistant_message.content
+            tool_calls = assistant_message.tool_calls or []
+        except (AttributeError, IndexError, TypeError) as error:
+            raise AgentLoopError("LLM returned a malformed response") from error
+
+        if not tool_calls:
+            if not isinstance(content, str):
+                raise AgentLoopError("LLM returned a final response without text")
+            messages.append({"role": "assistant", "content": content})
+            return content
+
+        assistant_entry: dict[str, Any] = {
+            "role": "assistant",
+            "content": content,
+            "tool_calls": [],
+        }
+        pending_calls: list[tuple[str, Any, Any]] = []
+        for call in tool_calls:
+            try:
+                call_id = call.id
+                function = call.function
+                tool_name = function.name
+                arguments = function.arguments
+            except AttributeError as error:
+                raise AgentLoopError("LLM returned a malformed tool call") from error
+            if not isinstance(call_id, str) or not call_id:
+                raise AgentLoopError("LLM returned a tool call without a valid ID")
+
+            assistant_entry["tool_calls"].append(
+                {
+                    "id": call_id,
+                    "type": "function",
+                    "function": {"name": tool_name, "arguments": arguments},
+                }
+            )
+            pending_calls.append((call_id, tool_name, arguments))
+
+        # The assistant's tool-call record must precede its results in the
+        # history so the next LLM request can match every result to its call ID.
+        messages.append(assistant_entry)
+        for call_id, tool_name, arguments in pending_calls:
+            try:
+                result = execute_inventory_tool(
+                    tool_name, arguments, api_base_url=api_base_url
+                )
+            except Exception:
+                # The dispatcher normally returns structured errors itself;
+                # protect the conversation if an unexpected failure escapes.
+                result = _error_result(
+                    "tool_execution_error", "Inventory tool execution failed"
+                )
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": call_id,
+                    "content": json.dumps(result, ensure_ascii=False),
+                }
+            )
+
+        if iteration == max_iterations - 1:
+            raise AgentLoopError(
+                f"Maximum LLM iterations ({max_iterations}) reached before a final answer"
+            )
+
+    raise AgentLoopError("Agent loop ended without a final answer")
