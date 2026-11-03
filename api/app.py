@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from uuid import uuid4
 
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI
 
 
 app = FastAPI()
@@ -81,3 +81,19 @@ class CsvProductStore:
             (product for product in self.list_all() if product.id == product_id),
             None,
         )
+
+
+product_store = CsvProductStore()
+
+
+def get_product_store() -> CsvProductStore:
+    """Provide the CSV-backed product store to API routes."""
+    return product_store
+
+
+@app.get("/inventory", response_model=list[Product])
+def get_inventory(
+    store: CsvProductStore = Depends(get_product_store),
+) -> list[Product]:
+    """Return all products in the inventory without modifying the CSV file."""
+    return store.list_all()
